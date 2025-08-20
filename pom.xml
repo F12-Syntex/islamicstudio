@@ -55,7 +55,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>dev.syntex.islamicstudio.Main</mainClass>
+                            <mainClass>com.syntex.islamicstudio.Main</mainClass>
                         </manifest>
                     </archive>
                     <descriptorRefs>
