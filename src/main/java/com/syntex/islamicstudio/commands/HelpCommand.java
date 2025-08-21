@@ -8,31 +8,35 @@ import java.util.List;
 import java.util.Map;
 
 import com.syntex.islamicstudio.cli.Color;
+import com.syntex.islamicstudio.cli.CommandCategory;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Model.CommandSpec;
 
 @CommandLine.Command(
-    name = "help",
-    description = "Show available commands or details for a specific command"
+        name = "help",
+        description = "Show available commands or details for a specific command"
 )
+@CommandCategory("Information")
 public class HelpCommand implements Runnable {
 
     @CommandLine.Spec
     CommandSpec spec;
 
     @CommandLine.Parameters(
-        index = "0",
-        arity = "0..1",
-        paramLabel = "COMMAND",
-        description = "Optional command name to show details for"
+            index = "0",
+            arity = "0..1",
+            paramLabel = "COMMAND",
+            description = "Optional command name to show details for"
     )
     private String commandName;
 
     private static class TreeChars {
+
         final String branch;
         final String lastBranch;
         final String vertical;
+
         TreeChars(String branch, String lastBranch, String vertical) {
             this.branch = branch;
             this.lastBranch = lastBranch;
@@ -63,38 +67,60 @@ public class HelpCommand implements Runnable {
     }
 
     private void printTree(CommandLine root) {
-        Map<String, String> commands = new HashMap<>();
-        for (Map.Entry<String, CommandLine> entry : root.getSubcommands().entrySet()) {
-            String desc = String.join(" ", entry.getValue().getCommandSpec().usageMessage().description());
-            commands.put(entry.getKey(), desc);
-        }
-        commands.put("exit", "Exit the application");
+        Map<String, CommandLine> subcommands = root.getSubcommands();
+        Map<String, Map<String, String>> categorized = new HashMap<>();
 
-        List<String> sorted = new ArrayList<>(commands.keySet());
-        Collections.sort(sorted);
+        // collect commands
+        for (Map.Entry<String, CommandLine> entry : subcommands.entrySet()) {
+            CommandLine cmd = entry.getValue();
+            String desc = String.join(" ", cmd.getCommandSpec().usageMessage().description());
+            CommandCategory cat = cmd.getCommand().getClass().getAnnotation(CommandCategory.class);
+            String category = (cat != null) ? cat.value() : "Other";
+
+            categorized.computeIfAbsent(category, k -> new HashMap<>())
+                    .put(entry.getKey(), desc);
+        }
+
+        // add exit as a system command
+        categorized.computeIfAbsent("System", k -> new HashMap<>())
+                .put("exit", "Exit the application");
+
+        // sort categories alphabetically
+        List<String> sortedCats = new ArrayList<>(categorized.keySet());
+        Collections.sort(sortedCats);
 
         TreeChars tree = getTreeChars();
 
         System.out.println(Color.CYAN.wrap("\n Islamic Studio CLI"));
-        System.out.println(Color.CYAN.wrap("──────────────────────"));
+        System.out.println(Color.CYAN.wrap("══════════════════════════════════"));
         System.out.println(Color.WHITE.wrap("Available Commands:\n"));
 
-        int longest = sorted.stream().mapToInt(String::length).max().orElse(10);
-        for (int i = 0; i < sorted.size(); i++) {
-            String cmd = sorted.get(i);
-            String desc = commands.get(cmd);
-            boolean last = (i == sorted.size() - 1);
+        for (String cat : sortedCats) {
+            System.out.println(Color.YELLOW.wrap(cat + ":"));
 
-            String branch = last ? tree.lastBranch : tree.branch;
-            String padding = " ".repeat(longest - cmd.length());
+            Map<String, String> cmds = categorized.get(cat);
+            List<String> sortedCmds = new ArrayList<>(cmds.keySet());
+            Collections.sort(sortedCmds);
 
-            System.out.printf("%s%s%s%s  %s%s%n",
-                    branch,
-                    Color.GREEN.code(), cmd, Color.RESET.code(),
-                    padding,
-                    Color.WHITE.wrap(desc));
+            int longest = sortedCmds.stream().mapToInt(String::length).max().orElse(10);
+
+            for (int i = 0; i < sortedCmds.size(); i++) {
+                String cmd = sortedCmds.get(i);
+                String desc = cmds.get(cmd);
+                boolean last = (i == sortedCmds.size() - 1);
+
+                String branch = last ? tree.lastBranch : tree.branch;
+                String padding = " ".repeat(longest - cmd.length());
+
+                System.out.printf("%s%s%s%s  %s%s%n",
+                        branch,
+                        Color.GREEN.code(), cmd, Color.RESET.code(),
+                        padding,
+                        Color.WHITE.wrap(desc));
+            }
+            System.out.println();
         }
-        System.out.println();
+
         System.out.println(Color.YELLOW.wrap("Tip: Use 'help <command>' for more details.\n"));
     }
 

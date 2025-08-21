@@ -1,11 +1,14 @@
 package com.syntex.islamicstudio.commands;
 
+import com.syntex.islamicstudio.cli.CommandCategory;
+
 import picocli.CommandLine;
 
 @CommandLine.Command(
     name = "clear",
     description = "Clear the screen"
 )
+@CommandCategory("Utility")
 public class ClearCommand implements Runnable {
     @Override
     public void run() {

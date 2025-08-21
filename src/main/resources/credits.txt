@@ -1,0 +1,11 @@
+#====================================================================
+# Islamic Studio CLI - Credits
+#====================================================================
+
+1. Quran Text (Uthmani, Version 1.1)  
+   Source: Thttps://tanzil.net/download/
+
+2. Translation: Sahih International  
+   Source: https://tanzil.net/trans/
+
+#====================================================================
