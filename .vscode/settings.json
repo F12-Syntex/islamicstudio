@@ -1,3 +1,17 @@
 {
-    "java.configuration.updateBuildConfiguration": "automatic"
+    // Ensure Java project build config stays in sync
+    "java.configuration.updateBuildConfiguration": "automatic",
+    // Terminal font with broad Unicode support (Arabic, emoji, etc.)
+    "terminal.integrated.fontFamily": "Cascadia Code, 'Noto Sans Mono', Consolas, 'Courier New', monospace",
+    // Force UTF-8 encoding in integrated terminal
+    "terminal.integrated.defaultProfile.windows": "PowerShell",
+    "terminal.integrated.env.windows": {
+        "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8"
+    },
+    "terminal.integrated.env.linux": {
+        "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8"
+    },
+    "terminal.integrated.env.osx": {
+        "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8"
+    }
 }
