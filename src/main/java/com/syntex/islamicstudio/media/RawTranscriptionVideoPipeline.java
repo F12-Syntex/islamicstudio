@@ -7,98 +7,146 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.text.AttributedCharacterIterator;
+import java.text.AttributedString;
+import java.awt.font.LineBreakMeasurer;
+import java.awt.font.TextAttribute;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import javax.imageio.ImageIO;
 
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import com.syntex.islamicstudio.db.DatabaseManager;
 
 /**
- * Pipeline: Audio -> Whisper transcription -> Identify surah -> Video with ayah
- * text Karaoke-style highlighting of current word (red).
+ * Pipeline: Audio -> Whisper (cached) -> Detect surah + start ayah (partial match)
+ * -> Align transcript -> Show current ayah (translation + footnotes) with highlights (rewindable).
  */
 public class RawTranscriptionVideoPipeline {
 
+    /** Word from Whisper */
     static class Word {
         public double start;
         public double end;
         public String text;
     }
 
+    /** Ayah data */
     static class Ayah {
         public int number;
+        public int surahId;
         public String arabic;
         public String translation;
         public List<String> words;
+        public List<String> footnotes;
 
-        public Ayah(int number, String arabic, String translation) {
+        public Ayah(int surahId, int number, String arabic, String translation, List<String> footnotes) {
+            this.surahId = surahId;
             this.number = number;
             this.arabic = arabic;
             this.translation = translation;
+            this.footnotes = footnotes;
             this.words = Arrays.asList(arabic.split("\\s+"));
         }
     }
 
-    private static class AyahWord {
-        Ayah ayah;
-        int index;
-        String word;
-        double start;
-        double end;
-
-        AyahWord(Ayah ayah, int index, String word) {
-            this.ayah = ayah;
-            this.index = index;
-            this.word = word;
-        }
+    /** Transcript per ayah with alignment */
+    static class AyahTranscript {
+        public int surahId;
+        public int ayahNumber;
+        public double start;
+        public double end;
+        public List<Word> words = new ArrayList<>();
+        public int[] alignment; // whisperWord[j] -> ayahWord index
     }
 
+    /** Mapping Whisper → Qur’an word (global) */
+    static class WordMapping {
+        Word whisper;
+        int surahId;
+        int ayahNumber;
+        int ayahWordIndex;
+    }
+
+    /** Surah detection result */
+    private static class SurahMatch {
+        int surahId;
+        int startAyah;
+        double score;
+    }
+
+    private static final Gson gson = new Gson();
+
     public static void main(String[] args) throws Exception {
-        File audioFile = new File("src/main/resources/recitations/095.mp3");
+        File audioFile = new File("src/main/resources/recitations/haqqah.mp3");
         File outputVideo = new File("output/transcribed_video.mp4");
 
-        // 1. Transcribe with Whisper (word-level approximation)
-        WhisperTranscriber whisper = new WhisperTranscriber();
-        List<Word> words = whisper.transcribeWithTimestamps(audioFile);
-        if (words.isEmpty()) {
-            System.err.println("⚠️ No transcription produced!");
-            return;
-        }
+        File transcriptFile = new File("output/transcripts", audioFile.getName() + ".json");
+        transcriptFile.getParentFile().mkdirs();
 
-        // 2. Identify surah from DB
-        int surahId;
-        List<Ayah> ayat;
-        try (Connection conn = DatabaseManager.getConnection()) {
-            surahId = detectSurah(conn, words);
-            ayat = loadSurah(conn, surahId);
-        }
-        System.out.println("✅ Detected surah id = " + surahId + " with " + ayat.size() + " ayat");
+        List<AyahTranscript> transcripts;
+        List<Word> rawWords;
+        SurahMatch match;
+        String transcriptText;
 
-        // 3. Build ayah word sequence WITH ayah boundaries respected
-        List<AyahWord> ayahWords = new ArrayList<>();
-        int wordIndex = 0;
-        for (Ayah ayah : ayat) {
-            for (int i = 0; i < ayah.words.size() && wordIndex < words.size(); i++) {
-                AyahWord aw = new AyahWord(ayah, i, ayah.words.get(i));
-                Word w = words.get(wordIndex);
-                aw.start = w.start;
-                aw.end = w.end;
-                ayahWords.add(aw);
-                wordIndex++;
+        if (transcriptFile.exists()) {
+            System.out.println("📖 Loading cached transcript: " + transcriptFile);
+            try (FileReader reader = new FileReader(transcriptFile)) {
+                transcripts = gson.fromJson(reader, new TypeToken<List<AyahTranscript>>() {}.getType());
             }
-            if (wordIndex >= words.size()) break;
+            rawWords = new ArrayList<>();
+            for (AyahTranscript at : transcripts) rawWords.addAll(at.words);
+            transcriptText = String.join(" ", rawWords.stream().map(w -> w.text).toList());
+
+            try (Connection conn = DatabaseManager.getConnection()) {
+                match = detectSurahSegment(conn, rawWords);
+            }
+        } else {
+            System.out.println("🎙️ Running Whisper transcription...");
+            WhisperTranscriber whisper = new WhisperTranscriber();
+            rawWords = whisper.transcribeWithTimestamps(audioFile);
+            if (rawWords.isEmpty()) {
+                System.err.println("⚠️ No transcription produced!");
+                return;
+            }
+            transcriptText = String.join(" ", rawWords.stream().map(w -> w.text).toList());
+
+            try (Connection conn = DatabaseManager.getConnection()) {
+                match = detectSurahSegment(conn, rawWords);
+                List<Ayah> ayat = loadSurah(conn, match.surahId, match.startAyah, transcriptText);
+                transcripts = alignTranscriptToSurah(rawWords, ayat);
+            }
+
+            try (FileWriter writer = new FileWriter(transcriptFile)) {
+                gson.toJson(transcripts, writer);
+            }
+            System.out.println("💾 Saved transcript to: " + transcriptFile);
         }
 
-        // 4. Render frames
+        System.out.printf("✅ Surah %d detected, starting from ayah %d%n", match.surahId, match.startAyah);
+
+        // Load ayahs for rendering
+        List<Ayah> surahAyat;
+        try (Connection conn = DatabaseManager.getConnection()) {
+            surahAyat = loadSurah(conn, match.surahId, match.startAyah, transcriptText);
+        }
+
+        // 🔄 Build global word mappings
+        List<WordMapping> mappings = buildWordMappings(transcripts);
+
+        // Render frames
         File framesDir = new File("output/frames");
         framesDir.mkdirs();
         int fps = 25;
-        double duration = words.get(words.size() - 1).end;
+        double duration = rawWords.get(rawWords.size() - 1).end;
         int totalFrames = (int) (duration * fps);
 
         int width = 1280, height = 720;
@@ -107,16 +155,14 @@ public class RawTranscriptionVideoPipeline {
         for (int f = 0; f < totalFrames; f++) {
             double t = f / (double) fps;
 
-            // find active word
-            AyahWord active = null;
-            for (AyahWord aw : ayahWords) {
-                if (t >= aw.start && t <= aw.end) {
-                    active = aw;
+            WordMapping active = null;
+            for (WordMapping wm : mappings) {
+                if (t >= wm.whisper.start && t <= wm.whisper.end) {
+                    active = wm;
                     break;
                 }
             }
 
-            // draw frame
             BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
             Graphics2D g = img.createGraphics();
 
@@ -127,12 +173,27 @@ public class RawTranscriptionVideoPipeline {
             g.fillRect(0, 0, width, height);
 
             if (active != null) {
-                g.setFont(new Font("SansSerif", Font.BOLD, 44));
-                drawAyahWithHighlight(g, active.ayah.arabic, active.index, width, height / 2);
+                Ayah ayah = findAyah(surahAyat, active.ayahNumber);
 
+                // Arabic with highlight
+                g.setFont(new Font("SansSerif", Font.BOLD, 44));
+                drawAyahWithHighlight(g, ayah.arabic, active.ayahWordIndex, width, height / 2);
+
+                // Translation
                 g.setColor(Color.LIGHT_GRAY);
                 g.setFont(new Font("Serif", Font.PLAIN, 28));
-                drawCentered(g, active.ayah.translation, width, height / 2 + 80);
+                drawCentered(g, ayah.translation, width, height / 2 + 80);
+
+                // Footnotes
+                if (ayah.footnotes != null && !ayah.footnotes.isEmpty()) {
+                    g.setColor(Color.GRAY);
+                    g.setFont(new Font("Serif", Font.ITALIC, 18));
+                    int margin = 40;
+                    int boxHeight = 180;
+                    int yStart = height - margin - boxHeight;
+                    String combined = String.join("  ", ayah.footnotes);
+                    drawWrappedTextLTR(g, combined, margin, yStart, width - 2 * margin, boxHeight);
+                }
             }
 
             g.dispose();
@@ -140,10 +201,11 @@ public class RawTranscriptionVideoPipeline {
             ImageIO.write(img, "png", out);
         }
 
-        // 5. Combine with ffmpeg
+        // FFmpeg combine
         ProcessBuilder pb = new ProcessBuilder(
                 "ffmpeg",
                 "-y",
+                "-threads", "4",
                 "-framerate", String.valueOf(fps),
                 "-i", "output/frames/frame%05d.png",
                 "-i", audioFile.getAbsolutePath(),
@@ -163,6 +225,8 @@ public class RawTranscriptionVideoPipeline {
         }
     }
 
+    // ===================== Rendering Helpers ======================
+
     private static void drawCentered(Graphics2D g, String text, int width, int y) {
         if (text == null || text.isBlank()) return;
         FontMetrics fm = g.getFontMetrics();
@@ -170,104 +234,242 @@ public class RawTranscriptionVideoPipeline {
         g.drawString(text, x, y);
     }
 
-    /**
-     * Draw ayah text with karaoke effect: highlight nth word in red.
-     * Rendered right-to-left (words reversed).
-     */
     private static void drawAyahWithHighlight(Graphics2D g, String ayahText, int activeIndex, int width, int y) {
         if (ayahText == null || ayahText.isBlank()) return;
-
         FontMetrics fm = g.getFontMetrics();
         String[] words = ayahText.split("\\s+");
-
-        // reverse order for Arabic rendering
         List<String> reversed = new ArrayList<>(Arrays.asList(words));
         java.util.Collections.reverse(reversed);
-
         int totalWidth = 0;
-        for (String w : reversed) {
-            totalWidth += fm.stringWidth(w + " ");
-        }
-
+        for (String w : reversed) totalWidth += fm.stringWidth(w + " ");
         int x = (width - totalWidth) / 2;
-
         for (int i = 0; i < reversed.size(); i++) {
-            // find the "visual index" of active word
             int originalIndex = words.length - 1 - i;
-            if (originalIndex == activeIndex) {
-                g.setColor(Color.RED);
-            } else {
-                g.setColor(Color.WHITE);
-            }
+            if (originalIndex == activeIndex) g.setColor(Color.RED);
+            else g.setColor(Color.WHITE);
             g.drawString(reversed.get(i), x, y);
             x += fm.stringWidth(reversed.get(i) + " ");
         }
     }
 
-    private static int detectSurah(Connection conn, List<Word> words) throws Exception {
-        String transcription = String.join(" ", words.stream().map(w -> w.text).toList());
-        String norm = normalizeArabic(transcription);
+    private static void drawWrappedTextLTR(Graphics2D g, String text, int x, int y, int maxWidth, int maxHeight) {
+        AttributedString attrStr = new AttributedString(text);
+        attrStr.addAttribute(TextAttribute.FONT, g.getFont());
+        AttributedCharacterIterator it = attrStr.getIterator();
+        LineBreakMeasurer lbm = new LineBreakMeasurer(it, g.getFontRenderContext());
+        float wrapWidth = maxWidth;
+        int usedHeight = 0;
+        while (lbm.getPosition() < it.getEndIndex() && usedHeight < maxHeight) {
+            var layout = lbm.nextLayout(wrapWidth);
+            y += layout.getAscent();
+            layout.draw(g, x, y);
+            y += layout.getDescent() + layout.getLeading();
+            usedHeight += layout.getAscent() + layout.getDescent() + layout.getLeading();
+        }
+        if (lbm.getPosition() < it.getEndIndex()) g.drawString("...", x, y + 20);
+    }
 
-        PreparedStatement ps = conn.prepareStatement("SELECT id FROM surah");
-        ResultSet rs = ps.executeQuery();
+    // ===================== Alignment ======================
 
-        int bestId = 1;
-        int bestScore = Integer.MAX_VALUE;
+    /** Fuzzy word match cost (0 = match, 1 = mismatch) */
+    private static int wordCost(String quranWord, String whisperWord) {
+        String a = normalizeArabic(quranWord);
+        String b = normalizeArabic(whisperWord);
+        if (a.isEmpty() || b.isEmpty()) return 1;
+        int dist = levenshtein(a, b);
+        int maxLen = Math.max(a.length(), b.length());
+        double sim = 1.0 - (double) dist / (double) maxLen;
+        return (sim >= 0.7) ? 0 : 1;
+    }
 
-        while (rs.next()) {
-            int surahId = rs.getInt("id");
-            PreparedStatement ps2 = conn.prepareStatement(
-                    "SELECT GROUP_CONCAT(t.text, ' ') as fulltext " +
-                    "FROM ayah a " +
-                    "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
-                    "WHERE a.surah_id=?"
-            );
-            ps2.setInt(1, surahId);
-            ResultSet rs2 = ps2.executeQuery();
-            if (rs2.next()) {
-                String dbText = normalizeArabic(rs2.getString("fulltext"));
-                int dist = levenshtein(norm, dbText);
-                if (dist < bestScore) {
-                    bestScore = dist;
-                    bestId = surahId;
+    private static int[] alignWords(List<String> ayahWords, List<Word> whisperWords) {
+        int n = ayahWords.size(), m = whisperWords.size();
+        int[][] dp = new int[n + 1][m + 1];
+        int[][] back = new int[n + 1][m + 1];
+        for (int i = 0; i <= n; i++) dp[i][0] = i;
+        for (int j = 0; j <= m; j++) dp[0][j] = j;
+
+        for (int i = 1; i <= n; i++) {
+            for (int j = 1; j <= m; j++) {
+                int cost = wordCost(ayahWords.get(i - 1), whisperWords.get(j - 1).text);
+                int del = dp[i - 1][j] + 1;
+                int ins = dp[i][j - 1] + 1;
+                int sub = dp[i - 1][j - 1] + cost;
+                dp[i][j] = Math.min(Math.min(del, ins), sub);
+                if (dp[i][j] == sub) back[i][j] = 0;
+                else if (dp[i][j] == del) back[i][j] = 1;
+                else back[i][j] = 2;
+            }
+        }
+
+        int[] map = new int[m];
+        Arrays.fill(map, -1);
+        int i = n, j = m;
+        while (i > 0 && j > 0) {
+            if (back[i][j] == 0) {
+                if (dp[i][j] == dp[i - 1][j - 1]) map[j - 1] = i - 1;
+                i--; j--;
+            } else if (back[i][j] == 1) {
+                i--;
+            } else {
+                j--;
+            }
+        }
+
+        // fallback: map unmapped Whisper words to nearest Qur’an word
+        for (int w = 0; w < m; w++) {
+            if (map[w] == -1 && n > 0) {
+                map[w] = Math.min(w, n - 1);
+            }
+        }
+        return map;
+    }
+
+    private static List<AyahTranscript> alignTranscriptToSurah(List<Word> words, List<Ayah> ayat) {
+        List<AyahTranscript> transcripts = new ArrayList<>();
+        int wordIndex = 0;
+        for (Ayah ayah : ayat) {
+            if (wordIndex >= words.size()) break;
+            AyahTranscript at = new AyahTranscript();
+            at.surahId = ayah.surahId;
+            at.ayahNumber = ayah.number;
+
+            List<Word> ayahWords = new ArrayList<>();
+            for (int i = 0; i < ayah.words.size() && wordIndex < words.size(); i++) {
+                ayahWords.add(words.get(wordIndex++));
+            }
+            at.words = ayahWords;
+
+            if (!ayahWords.isEmpty()) {
+                at.start = ayahWords.get(0).start;
+                at.end = ayahWords.get(ayahWords.size() - 1).end;
+            }
+
+            at.alignment = alignWords(ayah.words, ayahWords);
+            transcripts.add(at);
+        }
+        return transcripts;
+    }
+
+    /** Build global mapping for rewindable highlights */
+    private static List<WordMapping> buildWordMappings(List<AyahTranscript> transcripts) {
+        List<WordMapping> mappings = new ArrayList<>();
+        for (AyahTranscript at : transcripts) {
+            for (int j = 0; j < at.words.size(); j++) {
+                Word w = at.words.get(j);
+                int mappedIndex = (at.alignment != null && j < at.alignment.length) ? at.alignment[j] : -1;
+                WordMapping wm = new WordMapping();
+                wm.whisper = w;
+                wm.surahId = at.surahId;
+                wm.ayahNumber = at.ayahNumber;
+                wm.ayahWordIndex = mappedIndex;
+                mappings.add(wm);
+            }
+        }
+        return mappings;
+    }
+
+    // ===================== DB ======================
+
+    private static Ayah findAyah(List<Ayah> ayat, int number) {
+        for (Ayah a : ayat) if (a.number == number) return a;
+        return null;
+    }
+
+    /** Detect surah + start ayah using sliding-window fuzzy match */
+    private static SurahMatch detectSurahSegment(Connection conn, List<Word> words) throws Exception {
+        String transcript = String.join(" ", words.stream().map(w -> w.text).toList());
+        String normTranscript = normalizeArabic(transcript);
+
+        SurahMatch best = new SurahMatch();
+        best.score = -1.0;
+
+        PreparedStatement psSurah = conn.prepareStatement("SELECT id FROM surah");
+        ResultSet rsSurah = psSurah.executeQuery();
+
+        while (rsSurah.next()) {
+            int surahId = rsSurah.getInt("id");
+
+            PreparedStatement ps = conn.prepareStatement(
+                "SELECT a.ayah_number, t.text " +
+                "FROM ayah a " +
+                "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
+                "WHERE a.surah_id=? ORDER BY a.ayah_number");
+            ps.setInt(1, surahId);
+            ResultSet rs = ps.executeQuery();
+
+            List<String> ayahTexts = new ArrayList<>();
+            while (rs.next()) {
+                ayahTexts.add(normalizeArabic(rs.getString("text")));
+            }
+
+            int windowSize = 15;
+            for (int start = 0; start < ayahTexts.size(); start++) {
+                int end = Math.min(start + windowSize, ayahTexts.size());
+                String chunk = String.join(" ", ayahTexts.subList(start, end));
+
+                int dist = levenshtein(normTranscript, chunk);
+                int maxLen = Math.max(normTranscript.length(), chunk.length());
+                double similarity = 1.0 - (double) dist / (double) maxLen;
+
+                if (similarity > best.score) {
+                    best.surahId = surahId;
+                    best.startAyah = start + 1;
+                    best.score = similarity;
                 }
             }
         }
-        return bestId;
+
+        System.out.printf("🔍 Best match: Surah %d starting at ayah %d (score=%.3f)%n",
+                          best.surahId, best.startAyah, best.score);
+        return best;
     }
 
-    private static List<Ayah> loadSurah(Connection conn, int surahId) throws Exception {
+    private static List<Ayah> loadSurah(Connection conn, int surahId, int startAyah, String transcript) throws Exception {
         List<Ayah> ayat = new ArrayList<>();
-        PreparedStatement ps = conn.prepareStatement(
-                "SELECT a.ayah_number, t.text, t.bismillah, tr.translation " +
-                "FROM ayah a " +
-                "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
-                "JOIN ayah_translation tr ON tr.ayah_id=a.id AND tr.source_id=1 " +
-                "WHERE a.surah_id=? ORDER BY a.ayah_number"
-        );
-        ps.setInt(1, surahId);
-        ResultSet rs = ps.executeQuery();
+        boolean transcriptHasBismillah = transcript.contains("بسم الله");
 
-        boolean bismillahAdded = false;
+        PreparedStatement ps = conn.prepareStatement(
+            "SELECT a.id, a.ayah_number, a.surah_id, t.text, t.bismillah, tr.translation " +
+            "FROM ayah a " +
+            "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
+            "JOIN ayah_translation tr ON tr.ayah_id=a.id AND tr.source_id=1 " +
+            "WHERE a.surah_id=? AND a.ayah_number>=? ORDER BY a.ayah_number");
+        ps.setInt(1, surahId);
+        ps.setInt(2, startAyah);
+        ResultSet rs = ps.executeQuery();
         while (rs.next()) {
+            int ayahId = rs.getInt("id");
+            int num = rs.getInt("ayah_number");
             String arabic = rs.getString("text");
             String bismillah = rs.getString("bismillah");
+            String translation = rs.getString("translation");
 
-            // If surah has bismillah and we haven't added it yet, make it a separate ayah
-            if (!bismillahAdded && bismillah != null && !bismillah.isBlank()) {
-                ayat.add(new Ayah(0, bismillah.trim(), "(In the Name of Allah, the Entirely Merciful, the Especially Merciful)"));
-                bismillahAdded = true;
+            if (num == 1 && bismillah != null && !bismillah.isBlank() && transcriptHasBismillah) {
+                ayat.add(new Ayah(surahId, 0, bismillah,
+                        "(In the Name of Allah, the Entirely Merciful, the Especially Merciful)", List.of()));
             }
 
-            ayat.add(new Ayah(rs.getInt("ayah_number"), arabic, rs.getString("translation")));
+            List<String> footnotes = new ArrayList<>();
+            PreparedStatement psFoot = conn.prepareStatement(
+                "SELECT marker, content FROM translation_footnote " +
+                "WHERE ayah_translation_id IN " +
+                "(SELECT id FROM ayah_translation WHERE ayah_id=? AND source_id=1)");
+            psFoot.setInt(1, ayahId);
+            ResultSet rsFoot = psFoot.executeQuery();
+            while (rsFoot.next()) {
+                footnotes.add("[" + rsFoot.getString("marker") + "] " + rsFoot.getString("content"));
+            }
+
+            ayat.add(new Ayah(surahId, num, arabic, translation, footnotes));
         }
         return ayat;
     }
 
     private static String normalizeArabic(String input) {
         if (input == null) return "";
-        return input.replaceAll("[\\u064B-\\u065F]", "") // remove harakat
-                .replaceAll("[^\\p{IsArabic} ]", "") // keep Arabic + space
+        return input.replaceAll("[\\u064B-\\u065F]", "")
+                .replaceAll("[^\\p{IsArabic} ]", "")
                 .replaceAll("\\s+", " ")
                 .trim();
     }
@@ -279,11 +481,8 @@ public class RawTranscriptionVideoPipeline {
         for (int i = 1; i <= a.length(); i++) {
             for (int j = 1; j <= b.length(); j++) {
                 int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
-                dp[i][j] = Math.min(Math.min(
-                        dp[i - 1][j] + 1,
-                        dp[i][j - 1] + 1),
-                        dp[i - 1][j - 1] + cost
-                );
+                dp[i][j] = Math.min(Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1),
+                                    dp[i - 1][j - 1] + cost);
             }
         }
         return dp[a.length()][b.length()];
