@@ -4,7 +4,7 @@ const { exec } = require('child_process');
 
 
 function getAllFiles(dirPath, arrayOfFiles = []) {
-  const metadataFolders = ['.git', '.venv', 'node_modules', '.idea', '.vscode', "target"];
+  const metadataFolders = ['.git', '.venv', 'node_modules', '.idea', '.vscode', "target", "resources"];
   const files = fs.readdirSync(dirPath);
 
   files.forEach(file => {
@@ -16,6 +16,8 @@ function getAllFiles(dirPath, arrayOfFiles = []) {
     if (file.endsWith('.mdb')) return; // Ignore .mdb files
     if (file.endsWith('.csv')) return; // Ignore .csv files
     if (file.endsWith('.xml')) return; // Ignore .xml files
+    if (file.endsWith('.ttf')) return; // Ignore .ttf files
+    if (file.endsWith('.mp3')) return; // Ignore .mp3 files
 
     const fullPath = path.join(dirPath, file);
     if (fs.statSync(fullPath).isDirectory()) {
@@ -27,8 +29,6 @@ function getAllFiles(dirPath, arrayOfFiles = []) {
 
   return arrayOfFiles;
 }
-
-
 
 function copyToClipboard(text, fileList) {
   // Detect OS and use appropriate clipboard command

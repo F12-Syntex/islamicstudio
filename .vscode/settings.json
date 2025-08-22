@@ -13,5 +13,6 @@
     },
     "terminal.integrated.env.osx": {
         "JAVA_TOOL_OPTIONS": "-Dfile.encoding=UTF-8"
-    }
+    },
+    "java.compile.nullAnalysis.mode": "automatic"
 }
