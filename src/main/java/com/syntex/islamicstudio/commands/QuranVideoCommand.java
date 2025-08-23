@@ -26,11 +26,17 @@ public class QuranVideoCommand implements Runnable {
     )
     private File outputFile = new File("output/quran_video.mp4");
 
+    @CommandLine.Option(
+            names = {"--debug"},
+            description = "Enable debug mode (overlay raw transcript and highlight current word)"
+    )
+    private boolean debug = false;
+
     @Override
     public void run() {
         try {
             System.out.println("🎬 Generating Qur'anic video...");
-            QuranRecitationVideoMaker maker = new QuranRecitationVideoMaker();
+            QuranRecitationVideoMaker maker = new QuranRecitationVideoMaker(debug);
             maker.generateVideo(audioFile, outputFile);
             System.out.println("✅ Video generated successfully: " + outputFile.getAbsolutePath());
         } catch (Exception e) {

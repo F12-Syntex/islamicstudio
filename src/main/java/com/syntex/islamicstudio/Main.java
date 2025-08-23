@@ -36,7 +36,7 @@ public class Main implements Runnable {
             ));
 
             // 🔥 After imports, generate an image for a random ayah
-            generateRandomAyahImage();
+            // generateRandomAyahImage();
 
         } catch (Exception e) {
             System.err.println("⚠️ Failed to import resources: " + e.getMessage());

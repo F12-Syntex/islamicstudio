@@ -13,7 +13,11 @@ public class SubtitleWriter {
         this.out = new PrintWriter(new FileWriter(path, false), true);
     }
 
-    public void addSubtitle(double startSec, double endSec, String arabic, String translation) {
+    /**
+     * Ayah-level subtitles
+     */
+    public void addSubtitle(double startSec, double endSec,
+            String arabic, String translation, String currentWord) {
         int idx = counter.incrementAndGet();
         out.println(idx);
         out.printf("%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d%n",
@@ -21,17 +25,23 @@ public class SubtitleWriter {
                 (int) (endSec / 3600), (int) ((endSec % 3600) / 60), (int) (endSec % 60), (int) ((endSec * 1000) % 1000));
         out.println(arabic);
         out.println(translation);
+        out.println("[RAW] " + currentWord);   // ✅ just the current word
         out.println();
     }
 
-    public void addWordSubtitle(double startSec, double endSec, String fullText, String currentWord) {
+    /**
+     * Word-level subtitles
+     */
+    public void addWordSubtitle(double startSec, double endSec,
+            String word, String currentWord, String rawWord) {
         int idx = counter.incrementAndGet();
         out.println(idx);
         out.printf("%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d%n",
                 (int) (startSec / 3600), (int) ((startSec % 3600) / 60), (int) (startSec % 60), (int) ((startSec * 1000) % 1000),
                 (int) (endSec / 3600), (int) ((endSec % 3600) / 60), (int) (endSec % 60), (int) ((endSec * 1000) % 1000));
-        out.println(fullText);             // first line: whole sentence/ayah
-        out.println("[" + currentWord + "]");  // second line: highlight word
+
+        // 👇 Only show the current word once
+        out.println(word);
         out.println();
     }
 

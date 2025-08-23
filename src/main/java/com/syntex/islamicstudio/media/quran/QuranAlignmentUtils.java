@@ -4,7 +4,6 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 import com.syntex.islamicstudio.media.quran.model.Ayah;
@@ -15,12 +14,13 @@ import com.syntex.islamicstudio.media.quran.model.WordMapping;
 
 /**
  * Utility methods for aligning Whisper transcripts with Qur'anic text in DB.
+ *
+ * Updated: uses dynamic programming (global alignment) instead of assuming
+ * sequential word consumption. This allows repeats, backtracking, or mistakes
+ * without drifting alignment.
  */
 public class QuranAlignmentUtils {
 
-    /**
-     * Fuzzy word match cost (0 = match, 1 = mismatch).
-     */
     private static int wordCost(String quranWord, String whisperWord) {
         String a = normalizeArabic(quranWord);
         String b = normalizeArabic(whisperWord);
@@ -33,117 +33,86 @@ public class QuranAlignmentUtils {
         return (sim >= 0.7) ? 0 : 1;
     }
 
-    /**
-     * Align whisper words to ayah words (dynamic programming).
-     */
-    public static int[] alignWords(List<String> ayahWords, List<Word> whisperWords) {
-        int n = ayahWords.size(), m = whisperWords.size();
+    public static List<WordMapping> alignTranscriptFlexible(List<Word> whisperWords, List<Ayah> ayat) {
+        List<String> quranWords = new ArrayList<>();
+        List<int[]> meta = new ArrayList<>();
+        for (Ayah ayah : ayat) {
+            for (int i = 0; i < ayah.words.size(); i++) {
+                quranWords.add(ayah.words.get(i));
+                meta.add(new int[]{ayah.surahId, ayah.number, i});
+            }
+        }
+
+        int n = quranWords.size();
+        int m = whisperWords.size();
         int[][] dp = new int[n + 1][m + 1];
         int[][] back = new int[n + 1][m + 1];
-        for (int i = 0; i <= n; i++) {
-            dp[i][0] = i;
-        }
-        for (int j = 0; j <= m; j++) {
-            dp[0][j] = j;
-        }
+
+        for (int i = 0; i <= n; i++) dp[i][0] = i;
+        for (int j = 0; j <= m; j++) dp[0][j] = j;
 
         for (int i = 1; i <= n; i++) {
             for (int j = 1; j <= m; j++) {
-                int cost = wordCost(ayahWords.get(i - 1), whisperWords.get(j - 1).text);
+                int cost = wordCost(quranWords.get(i - 1), whisperWords.get(j - 1).text);
                 int del = dp[i - 1][j] + 1;
                 int ins = dp[i][j - 1] + 1;
                 int sub = dp[i - 1][j - 1] + cost;
                 dp[i][j] = Math.min(Math.min(del, ins), sub);
-                if (dp[i][j] == sub) {
-                    back[i][j] = 0;
-                } else if (dp[i][j] == del) {
-                    back[i][j] = 1;
-                } else {
-                    back[i][j] = 2;
-                }
+
+                if (dp[i][j] == sub) back[i][j] = 0;
+                else if (dp[i][j] == del) back[i][j] = 1;
+                else back[i][j] = 2;
             }
         }
 
-        int[] map = new int[m];
-        Arrays.fill(map, -1);
+        List<WordMapping> mappings = new ArrayList<>();
         int i = n, j = m;
         while (i > 0 && j > 0) {
             if (back[i][j] == 0) {
-                if (dp[i][j] == dp[i - 1][j - 1]) {
-                    map[j - 1] = i - 1;
-                }
-                i--;
-                j--;
+                Word w = whisperWords.get(j - 1);
+                int[] metaInfo = meta.get(i - 1);
+                WordMapping wm = new WordMapping();
+                wm.whisper = w;
+                wm.surahId = metaInfo[0];
+                wm.ayahNumber = metaInfo[1];
+                wm.ayahWordIndex = metaInfo[2];
+                mappings.add(0, wm);
+                i--; j--;
             } else if (back[i][j] == 1) {
                 i--;
             } else {
                 j--;
             }
         }
-
-        // fallback: map unmapped Whisper words to nearest Qur’an word
-        for (int w = 0; w < m; w++) {
-            if (map[w] == -1 && n > 0) {
-                map[w] = Math.min(w, n - 1);
-            }
-        }
-        return map;
+        return mappings;
     }
 
-    /**
-     * Align full transcript to surah ayat.
-     */
-    public static List<AyahTranscript> alignTranscriptToSurah(List<Word> words, List<Ayah> ayat) {
+    public static List<AyahTranscript> buildAyahTranscripts(List<WordMapping> mappings) {
         List<AyahTranscript> transcripts = new ArrayList<>();
-        int wordIndex = 0;
-        for (Ayah ayah : ayat) {
-            if (wordIndex >= words.size()) {
-                break;
-            }
-            AyahTranscript at = new AyahTranscript();
-            at.surahId = ayah.surahId;
-            at.ayahNumber = ayah.number;
+        AyahTranscript current = null;
 
-            List<Word> ayahWords = new ArrayList<>();
-            for (int i = 0; i < ayah.words.size() && wordIndex < words.size(); i++) {
-                ayahWords.add(words.get(wordIndex++));
+        for (WordMapping wm : mappings) {
+            if (current == null || current.ayahNumber != wm.ayahNumber || current.surahId != wm.surahId) {
+                if (current != null && !current.words.isEmpty()) {
+                    current.start = current.words.get(0).start;
+                    current.end = current.words.get(current.words.size() - 1).end;
+                    transcripts.add(current);
+                }
+                current = new AyahTranscript();
+                current.surahId = wm.surahId;
+                current.ayahNumber = wm.ayahNumber;
             }
-            at.words = ayahWords;
+            current.words.add(wm.whisper);
+        }
 
-            if (!ayahWords.isEmpty()) {
-                at.start = ayahWords.get(0).start;
-                at.end = ayahWords.get(ayahWords.size() - 1).end;
-            }
-
-            at.alignment = alignWords(ayah.words, ayahWords);
-            transcripts.add(at);
+        if (current != null && !current.words.isEmpty()) {
+            current.start = current.words.get(0).start;
+            current.end = current.words.get(current.words.size() - 1).end;
+            transcripts.add(current);
         }
         return transcripts;
     }
 
-    /**
-     * Build global mapping for rewindable highlights.
-     */
-    public static List<WordMapping> buildWordMappings(List<AyahTranscript> transcripts) {
-        List<WordMapping> mappings = new ArrayList<>();
-        for (AyahTranscript at : transcripts) {
-            for (int j = 0; j < at.words.size(); j++) {
-                Word w = at.words.get(j);
-                int mappedIndex = (at.alignment != null && j < at.alignment.length) ? at.alignment[j] : -1;
-                WordMapping wm = new WordMapping();
-                wm.whisper = w;
-                wm.surahId = at.surahId;
-                wm.ayahNumber = at.ayahNumber;
-                wm.ayahWordIndex = mappedIndex;
-                mappings.add(wm);
-            }
-        }
-        return mappings;
-    }
-
-    /**
-     * Detect surah + start ayah using fuzzy sliding-window match.
-     */
     public static SurahMatch detectSurahSegment(Connection conn, List<Word> words) throws Exception {
         String transcript = String.join(" ", words.stream().map(w -> w.text).toList());
         String normTranscript = normalizeArabic(transcript);
@@ -185,21 +154,17 @@ public class QuranAlignmentUtils {
                 }
             }
         }
-
         return best;
     }
 
     public static List<Ayah> loadSurah(Connection conn, int surahId, int startAyah, String transcript) throws Exception {
         List<Ayah> ayat = new ArrayList<>();
 
-        // get surah name (Arabic)
         String surahName = "?";
         try (PreparedStatement ps = conn.prepareStatement("SELECT name_ar FROM surah WHERE id=?")) {
             ps.setInt(1, surahId);
             ResultSet rs = ps.executeQuery();
-            if (rs.next()) {
-                surahName = rs.getString("name_ar");
-            }
+            if (rs.next()) surahName = rs.getString("name_ar");
         }
 
         PreparedStatement ps = conn.prepareStatement(
@@ -219,16 +184,8 @@ public class QuranAlignmentUtils {
             String bismillah = rs.getString("bismillah");
             String translation = rs.getString("translation");
 
-            // ✅ If bismillah is present, treat it as a separate ayah (0)
             if (bismillah != null && !bismillah.isBlank()) {
-                ayat.add(new Ayah(
-                        surahId,
-                        0, // ayah number 0 for bismillah
-                        surahName,
-                        bismillah,
-                        "", // no translation
-                        new ArrayList<>() // no footnotes
-                ));
+                ayat.add(new Ayah(surahId, 0, surahName, bismillah, "", new ArrayList<>()));
             }
 
             List<String> footnotes = new ArrayList<>();
@@ -242,18 +199,13 @@ public class QuranAlignmentUtils {
                 footnotes.add("[" + rsFoot.getString("marker") + "] " + rsFoot.getString("content"));
             }
 
-            // Normal ayah
             ayat.add(new Ayah(surahId, num, surahName, arabic, translation, footnotes));
         }
-
         return ayat;
     }
 
-    // ===== Normalization + Levenshtein ===== //
     private static String normalizeArabic(String input) {
-        if (input == null) {
-            return "";
-        }
+        if (input == null) return "";
         return input.replaceAll("[\\u064B-\\u065F]", "")
                 .replaceAll("[^\\p{IsArabic} ]", "")
                 .replaceAll("\\s+", " ")
@@ -262,12 +214,9 @@ public class QuranAlignmentUtils {
 
     private static int levenshtein(String a, String b) {
         int[][] dp = new int[a.length() + 1][b.length() + 1];
-        for (int i = 0; i <= a.length(); i++) {
-            dp[i][0] = i;
-        }
-        for (int j = 0; j <= b.length(); j++) {
-            dp[0][j] = j;
-        }
+        for (int i = 0; i <= a.length(); i++) dp[i][0] = i;
+        for (int j = 0; j <= b.length(); j++) dp[0][j] = j;
+
         for (int i = 1; i <= a.length(); i++) {
             for (int j = 1; j <= b.length(); j++) {
                 int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;

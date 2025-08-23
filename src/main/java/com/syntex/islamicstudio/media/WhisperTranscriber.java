@@ -18,9 +18,10 @@ import com.syntex.islamicstudio.media.quran.model.Word;
 
 /**
  * Wrapper around OpenAI Whisper API for transcription.
- * Now supports both:
- *  - word-level approximation
- *  - segment-level (ayah-level) transcription
+ * Supports:
+ * - plain text
+ * - segment-level (ayah)
+ * - word-level timestamps (true Whisper output)
  */
 public class WhisperTranscriber {
 
@@ -37,7 +38,7 @@ public class WhisperTranscriber {
         Path path = audioFile.toPath();
         TranscriptionCreateParams params = TranscriptionCreateParams.builder()
                 .file(path)
-                .model(AudioModel.WHISPER_1)
+                .model(AudioModel.GPT_4O_TRANSCRIBE)
                 .build();
 
         return client.audio()
@@ -48,21 +49,22 @@ public class WhisperTranscriber {
     }
 
     /**
-     * Return Whisper segments (ayah-level chunks).
+     * Return Whisper segments (ayah-level chunks with start/end).
      */
     public List<Segment> transcribeSegments(File audioFile) {
         Path path = audioFile.toPath();
         TranscriptionCreateParams params = TranscriptionCreateParams.builder()
                 .file(path)
-                .model(AudioModel.WHISPER_1)
+                .model(AudioModel.GPT_4O_TRANSCRIBE)
                 .responseFormat(AudioResponseFormat.VERBOSE_JSON)
+                .timestampGranularities(List.of(TranscriptionCreateParams.TimestampGranularity.SEGMENT))
                 .build();
 
         TranscriptionCreateResponse response = client.audio().transcriptions().create(params);
 
         List<Segment> segmentsOut = new ArrayList<>();
 
-        if (response.verbose() != null) {
+        if (response.verbose().isPresent()) {
             Optional<TranscriptionVerbose> verboseOpt = response.verbose();
             if (verboseOpt.isPresent() && verboseOpt.get().segments().isPresent()) {
                 List<TranscriptionSegment> segments = verboseOpt.get().segments().get();
@@ -71,24 +73,35 @@ public class WhisperTranscriber {
                 }
             }
         }
+
         return segmentsOut;
     }
 
     /**
-     * Return word-level timestamps by splitting segments evenly.
+     * Return word-level timestamps (from Whisper API directly).
      */
     public List<Word> transcribeWithTimestamps(File audioFile) {
+        Path path = audioFile.toPath();
+        TranscriptionCreateParams params = TranscriptionCreateParams.builder()
+                .file(path)
+                .model(AudioModel.WHISPER_1)
+                .responseFormat(AudioResponseFormat.VERBOSE_JSON)
+                .timestampGranularities(List.of(TranscriptionCreateParams.TimestampGranularity.WORD))
+                .build();
+
+        TranscriptionCreateResponse response = client.audio().transcriptions().create(params);
+
         List<Word> words = new ArrayList<>();
-        for (Segment seg : transcribeSegments(audioFile)) {
-            String[] segWords = seg.text.trim().split("\\s+");
-            double wordDur = (seg.end - seg.start) / segWords.length;
-            for (int i = 0; i < segWords.length; i++) {
-                Word w = new Word();
-                w.text = segWords[i];
-                w.start = seg.start + i * wordDur;
-                w.end = w.start + wordDur;
-                words.add(w);
+        if (response.verbose().isPresent() && response.verbose().get().words().isPresent()) {
+            for (var w : response.verbose().get().words().get()) {
+                Word word = new Word();
+                word.text = w.word();
+                word.start = w.start();
+                word.end = w.end();
+                words.add(word);
             }
+        } else {
+            throw new IllegalStateException("Whisper did not return word-level timestamps.");
         }
         return words;
     }
@@ -100,6 +113,7 @@ public class WhisperTranscriber {
         public final double start;
         public final double end;
         public final String text;
+
         public Segment(double start, double end, String text) {
             this.start = start;
             this.end = end;

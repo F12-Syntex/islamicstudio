@@ -14,6 +14,9 @@ import java.text.AttributedCharacterIterator;
 import java.text.AttributedString;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import javax.imageio.ImageIO;
 
@@ -29,14 +32,21 @@ import com.syntex.islamicstudio.media.quran.model.Ayah;
 import com.syntex.islamicstudio.media.quran.model.AyahTranscript;
 import com.syntex.islamicstudio.media.quran.model.SurahMatch;
 import com.syntex.islamicstudio.media.quran.model.Word;
+import com.syntex.islamicstudio.media.quran.model.WordMapping;
 
 public class QuranRecitationVideoMaker {
 
     private static final Gson gson = new Gson();
     private final OpenAIClient openAi;
+    private final boolean debug;
 
     public QuranRecitationVideoMaker() {
+        this(false);
+    }
+
+    public QuranRecitationVideoMaker(boolean debug) {
         this.openAi = OpenAIOkHttpClient.fromEnv();
+        this.debug = debug;
     }
 
     public void generateVideo(File audioFile, File outputVideo) throws Exception {
@@ -78,7 +88,8 @@ public class QuranRecitationVideoMaker {
             try (Connection conn = DatabaseManager.getConnection()) {
                 match = QuranAlignmentUtils.detectSurahSegment(conn, rawWords);
                 List<Ayah> ayat = QuranAlignmentUtils.loadSurah(conn, match.surahId, match.startAyah, joinWords(rawWords));
-                transcripts = QuranAlignmentUtils.alignTranscriptToSurah(rawWords, ayat);
+                List<WordMapping> mappings = QuranAlignmentUtils.alignTranscriptFlexible(rawWords, ayat);
+                transcripts = QuranAlignmentUtils.buildAyahTranscripts(mappings);
             }
 
             try (FileWriter writer = new FileWriter(transcriptFile)) {
@@ -90,22 +101,27 @@ public class QuranRecitationVideoMaker {
         try (Connection conn = DatabaseManager.getConnection()) {
             surahAyat = QuranAlignmentUtils.loadSurah(conn, match.surahId, match.startAyah, joinWords(rawWords));
         }
+        if (transcripts == null || transcripts.isEmpty()) {
+            List<WordMapping> mappings = QuranAlignmentUtils.alignTranscriptFlexible(rawWords, surahAyat);
+            transcripts = QuranAlignmentUtils.buildAyahTranscripts(mappings);
+        }
 
         String suggestion = suggestBackground(match.surahId, match.startAyah, surahAyat);
-        File bgVideo = PixabayDownloader.downloadBackgroundVideo(suggestion, workDir);
 
-        // render one PNG per ayah
+        List<File> bgVideos = PixabayDownloader.downloadBackgroundVideos(suggestion, workDir, 3);
+
         renderAyahFrames(framesDir, surahAyat, transcripts);
 
         if (outputVideo == null) {
             outputVideo = new File(workDir, baseName + ".mp4");
         }
 
-        runOptimizedFfmpeg(framesDir, audioFile, outputVideo, bgVideo, transcripts);
+        runOptimizedFfmpeg(framesDir, audioFile, outputVideo, bgVideos, transcripts);
+
+        cleanupTempDir(workDir);
     }
 
-    // ================= Rendering ================= //
-    private static void renderAyahFrames(File framesDir, List<Ayah> surahAyat,
+    private void renderAyahFrames(File framesDir, List<Ayah> surahAyat,
             List<AyahTranscript> transcripts) throws Exception {
         int width = 1920, height = 1080;
 
@@ -113,123 +129,161 @@ public class QuranRecitationVideoMaker {
         Font englishFont = new Font("Serif", Font.PLAIN, 36);
         Font footnoteFont = new Font("Serif", Font.ITALIC, 24);
         Font titleFont = new Font("Serif", Font.BOLD, 40);
+        Font rawFont = new Font("Monospaced", Font.PLAIN, 22);
+
+        ExecutorService pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        List<Future<?>> tasks = new ArrayList<>();
 
         for (AyahTranscript at : transcripts) {
-            Ayah ayah = surahAyat.stream()
-                    .filter(a -> a.number == at.ayahNumber)
-                    .findFirst().orElse(null);
-            if (ayah == null) {
-                continue;
-            }
+            tasks.add(pool.submit(() -> {
+                try {
+                    Ayah ayah = surahAyat.stream()
+                            .filter(a -> a.number == at.ayahNumber)
+                            .findFirst().orElse(null);
+                    if (ayah == null) {
+                        return;
+                    }
 
-            BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-            Graphics2D g = img.createGraphics();
-            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+                    Graphics2D g = img.createGraphics();
+                    g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
 
-            int y = 100;
+                    int y = 100;
 
-            g.setFont(titleFont);
-            g.setColor(Color.YELLOW);
-            drawWrappedTextCentered(g, "سورة " + ayah.surahName, width, y);
-            y += 60;
+                    g.setFont(titleFont);
+                    g.setColor(Color.YELLOW);
+                    drawWrappedTextCentered(g, "Surah " + ayah.surahName, width, y);
+                    y += 60;
 
-            // Arabic
-            g.setFont(arabicFont);
-            g.setColor(Color.WHITE);
-            y = drawWrappedTextCentered(g, ayah.arabic, width, y);
+                    g.setFont(arabicFont);
+                    g.setColor(Color.WHITE);
+                    y = drawWrappedTextCentered(g, ayah.arabic, width, y);
+                    y += 40;
 
-            y += 40;
+                    g.setFont(englishFont);
+                    g.setColor(Color.WHITE);
+                    y = drawWrappedTextCentered(g, ayah.translation, width, y);
 
-            // Translation
-            g.setFont(englishFont);
-            g.setColor(Color.WHITE);
-            y = drawWrappedTextCentered(g, ayah.translation, width, y);
+                    if (ayah.footnotes != null && !ayah.footnotes.isEmpty()) {
+                        String combined = String.join("  ", ayah.footnotes);
+                        g.setFont(footnoteFont);
+                        int boxHeight = 150;
+                        g.setColor(new Color(0, 0, 0, 200));
+                        g.fillRect(0, height - boxHeight - 20, width, boxHeight);
+                        g.setColor(Color.WHITE);
+                        drawWrappedTextCentered(g, combined, width, height - boxHeight);
+                    }
 
-            // Footnotes at bottom in black box
-            if (ayah.footnotes != null && !ayah.footnotes.isEmpty()) {
-                String combined = String.join("  ", ayah.footnotes);
-                g.setFont(footnoteFont);
+                    if (debug) {
+                        g.setFont(rawFont);
+                        g.setColor(new Color(255, 255, 255, 220));
+                        int rawBoxHeight = 120;
+                        g.fillRect(0, height - rawBoxHeight, width, rawBoxHeight);
+                        if (!at.words.isEmpty()) {
+                            Word mid = at.words.get(at.words.size() / 2);
+                            drawWrappedTextCentered(g, "[RAW] " + mid.text,
+                                    width, height - rawBoxHeight + 40);
+                        }
+                    }
 
-                int boxHeight = 150;
-                g.setColor(new Color(0, 0, 0, 200));
-                g.fillRect(0, height - boxHeight - 20, width, boxHeight);
-
-                g.setColor(Color.WHITE);
-                drawWrappedTextCentered(g, combined, width, height - boxHeight);
-            }
-
-            g.dispose();
-            File out = new File(framesDir, String.format("ayah_%03d.png", at.ayahNumber));
-            ImageIO.write(img, "png", out);
+                    g.dispose();
+                    File out = new File(framesDir, String.format("ayah_%03d.png", at.ayahNumber));
+                    ImageIO.write(img, "png", out);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }));
         }
+
+        for (Future<?> f : tasks) {
+            f.get();
+        }
+        pool.shutdown();
     }
 
-    // ================= Optimized ffmpeg ================= //
     private static void runOptimizedFfmpeg(File framesDir, File audioFile, File outputVideo,
-            File bgVideo, List<AyahTranscript> transcripts) throws Exception {
+            List<File> bgVideos, List<AyahTranscript> transcripts) throws Exception {
+        double audioDuration = getAudioDuration(audioFile);
+
+        // ✅ normalize transcript timings so first ayah starts at 0
+        double timeOffset = transcripts.isEmpty() ? 0.0 : transcripts.get(0).start;
+
         List<String> cmd = new ArrayList<>();
         cmd.add("ffmpeg");
         cmd.add("-y");
 
-        // loop the background video infinitely until audio ends
-        cmd.add("-stream_loop");
-        cmd.add("-1");
-        cmd.add("-i");
-        cmd.add(bgVideo.getAbsolutePath());
-
-        // add ayah images as inputs
+// input background videos (looped)
+        for (File bg : bgVideos) {
+            cmd.add("-stream_loop");
+            cmd.add("-1");   // ✅ loop infinitely
+            cmd.add("-i");
+            cmd.add(bg.getAbsolutePath());
+        }
+        
         for (AyahTranscript at : transcripts) {
             File img = new File(framesDir, String.format("ayah_%03d.png", at.ayahNumber));
             cmd.add("-i");
             cmd.add(img.getAbsolutePath());
         }
-
-        // add audio
         cmd.add("-i");
         cmd.add(audioFile.getAbsolutePath());
 
-        // build filter_complex string
         StringBuilder filter = new StringBuilder();
-        filter.append("[0:v]scale=1920:1080,eq=brightness=-0.3[bg];");
-        String last = "[bg]";
 
-        for (int i = 0; i < transcripts.size(); i++) {
-            AyahTranscript at = transcripts.get(i);
-            double start = at.start;
-            double end = at.end;
-            String imgIn = "[" + (i + 1) + ":v]";
-            String out = "[v" + (i + 1) + "]";
-            filter.append(last).append(imgIn)
-                    .append("overlay=(W-w)/2:(H-h)/2:enable=between(t\\,")
-                    .append(start).append("\\,").append(end).append(")")
-                    .append(out).append(";");
+        for (int i = 0; i < bgVideos.size(); i++) {
+            filter.append("[").append(i).append(":v]")
+                    .append("scale=1920:1080,fps=30,format=yuv420p[v").append(i).append("];");
+        }
+
+        String last = "[v0]";
+        for (int i = 1; i < bgVideos.size(); i++) {
+            String next = "[v" + i + "]";
+            String out = "[vx" + i + "]";
+            double offset = (audioDuration / bgVideos.size()) * i;
+            filter.append(last).append(next)
+                    .append("xfade=transition=fade:duration=2:offset=")
+                    .append(offset).append(out).append(";");
             last = out;
         }
 
-        // proper final output
-        filter.append(last).append("copy[vout]");
+        String videoBase = last;
+        for (int i = 0; i < transcripts.size(); i++) {
+            AyahTranscript at = transcripts.get(i);
+            double start = Math.max(0, at.start - timeOffset);
+            double nextStart = (i < transcripts.size() - 1)
+                    ? Math.max(0, transcripts.get(i + 1).start - timeOffset)
+                    : audioDuration;
+
+            String imgIn = "[" + (bgVideos.size() + i) + ":v]";
+            String out = "[vv" + i + "]";
+            filter.append(videoBase).append(imgIn)
+                    .append("overlay=(W-w)/2:(H-h)/2:enable='between(t\\,")
+                    .append(start).append("\\,").append(nextStart).append(")'")
+                    .append(out).append(";");
+            videoBase = out;
+        }
+
+        int audioIndex = bgVideos.size() + transcripts.size();
+        filter.append("[").append(audioIndex).append(":a]anull[aout];");
 
         cmd.add("-filter_complex");
         cmd.add(filter.toString());
-
-        // map video + audio
         cmd.add("-map");
-        cmd.add("[vout]");
+        cmd.add(videoBase);
         cmd.add("-map");
-        cmd.add(transcripts.size() + 1 + ":a"); // audio is last input
-        cmd.add("-shortest");
+        cmd.add("[aout]");
+        cmd.add("-t");
+        cmd.add(String.valueOf(audioDuration));
+        cmd.add("-shortest"); // ✅ ensures video stops with audio
 
-        // encoding options
         cmd.add("-c:v");
         cmd.add("libx264");
         cmd.add("-pix_fmt");
         cmd.add("yuv420p");
         cmd.add("-c:a");
         cmd.add("aac");
-
         cmd.add(outputVideo.getAbsolutePath());
 
-        // run ffmpeg
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.inheritIO();
         int exit = pb.start().waitFor();
@@ -238,7 +292,24 @@ public class QuranRecitationVideoMaker {
         }
     }
 
-    // ================= OpenAI Suggestion ================= //
+    private static double getAudioDuration(File audioFile) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder("ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                audioFile.getAbsolutePath());
+        Process proc = pb.start();
+        String output = new String(proc.getInputStream().readAllBytes()).trim();
+        proc.waitFor();
+        return Double.parseDouble(output);
+    }
+
+    private static void cleanupTempDir(File dir) {
+        if (dir == null || !dir.exists()) {
+            return;
+        }
+        System.out.println("🗑 Cleaned temp dir: " + dir.getAbsolutePath());
+    }
+
     private String suggestBackground(int surahId, int startAyah, List<Ayah> ayat) {
         try {
             String surahName = ayat.isEmpty() ? ("Surah " + surahId) : ("Surah " + ayat.get(0).surahName);
@@ -255,8 +326,7 @@ public class QuranRecitationVideoMaker {
                     + "Guidelines:\n"
                     + "- Respond with a very short descriptive phrase only.\n"
                     + "- Avoid humans, animals, or any impermissible imagery.\n"
-                    + "- Prefer natural landscapes, abstract light, calligraphy textures, night sky, or oceans.\n"
-                    + "- Prompt is for pixabay, so please chose something that would return results.";
+                    + "- Prefer natural landscapes, abstract light, calligraphy textures, night sky, or oceans.";
 
             ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
                     .model("gpt-4o-mini")
@@ -266,25 +336,20 @@ public class QuranRecitationVideoMaker {
                     .build();
 
             ChatCompletion completion = openAi.chat().completions().create(params);
-
             return completion.choices().get(0).message().content().orElse("Abstract light background");
-
         } catch (Exception e) {
             return "Abstract gradient background (fallback)";
         }
     }
 
-    // ================= Drawing Helpers ================= //
     private static int drawWrappedTextCentered(Graphics2D g, String text, int width, int y) {
         if (text == null || text.isBlank()) {
-            return y; // nothing to draw
+            return y;
         }
-
         AttributedString attrStr = new AttributedString(text);
         attrStr.addAttribute(TextAttribute.FONT, g.getFont());
         AttributedCharacterIterator it = attrStr.getIterator();
         LineBreakMeasurer lbm = new LineBreakMeasurer(it, g.getFontRenderContext());
-
         float wrapWidth = width - 200;
         while (lbm.getPosition() < it.getEndIndex()) {
             var layout = lbm.nextLayout(wrapWidth);

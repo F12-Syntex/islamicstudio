@@ -5,6 +5,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -14,11 +16,13 @@ import com.syntex.islamicstudio.env.EnvManager;
 
 public class PixabayDownloader {
 
-    public static File downloadBackgroundVideo(String query, File workDir) throws Exception {
+    public static List<File> downloadBackgroundVideos(String query, File workDir, int count) throws Exception {
         String encoded = query.trim().replace(" ", "+").replaceAll("[^a-zA-Z0-9+]", "");
-        String apiUrl = "https://pixabay.com/api/videos/?key=" + EnvManager.getInstance().get(EnvKey.PIXABAY_API_KEY) + "&q=" + encoded;
+        String apiUrl = "https://pixabay.com/api/videos/?key="
+                + EnvManager.getInstance().get(EnvKey.PIXABAY_API_KEY)
+                + "&q=" + encoded;
 
-        System.out.println("📥 Searching for Pixabay video: " + apiUrl);
+        System.out.println("🔎 Searching Pixabay videos: " + apiUrl);
 
         HttpURLConnection conn = (HttpURLConnection) new URL(apiUrl).openConnection();
         conn.setRequestProperty("User-Agent", "IslamicStudio/1.0");
@@ -32,17 +36,20 @@ public class PixabayDownloader {
             throw new IllegalStateException("No Pixabay results for: " + query);
         }
 
-        JsonObject first = hits.get(0).getAsJsonObject();
-        JsonObject videos = first.getAsJsonObject("videos");
-        String url = videos.getAsJsonObject("medium").get("url").getAsString();
+        List<File> result = new ArrayList<>();
+        for (int i = 0; i < Math.min(count, hits.size()); i++) {
+            JsonObject first = hits.get(i).getAsJsonObject();
+            JsonObject videos = first.getAsJsonObject("videos");
+            String url = videos.getAsJsonObject("medium").get("url").getAsString();
 
-        System.out.println("📥 Downloading Pixabay video: " + url);
-
-        File out = new File(workDir, "background.mp4");
-        try (BufferedInputStream in = new BufferedInputStream(new URL(url).openStream()); FileOutputStream fos = new FileOutputStream(out)) {
-            in.transferTo(fos);
+            File out = new File(workDir, "bg" + (i + 1) + ".mp4");
+            try (BufferedInputStream in = new BufferedInputStream(new URL(url).openStream()); FileOutputStream fos = new FileOutputStream(out)) {
+                in.transferTo(fos);
+            }
+            System.out.println("✅ Downloaded " + out.getName());
+            result.add(out);
         }
 
-        return out;
+        return result;
     }
 }
