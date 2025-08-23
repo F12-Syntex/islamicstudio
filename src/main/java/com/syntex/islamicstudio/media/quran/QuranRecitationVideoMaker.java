@@ -28,6 +28,7 @@ import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.syntex.islamicstudio.db.DatabaseManager;
+import com.syntex.islamicstudio.media.PixabayDownloader;
 import com.syntex.islamicstudio.media.WhisperTranscriber;
 import com.syntex.islamicstudio.media.quran.model.Ayah;
 import com.syntex.islamicstudio.media.quran.model.AyahTranscript;

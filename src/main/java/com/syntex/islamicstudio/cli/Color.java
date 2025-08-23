@@ -16,6 +16,7 @@ public enum Color {
     WHITE("\u001B[37m"),
     BOLD("\u001B[1m"),
     UNDERLINE("\u001B[4m"),
+    LIGHT("\u001B[37;1m"),
     NONE("");
 
     private final String code;

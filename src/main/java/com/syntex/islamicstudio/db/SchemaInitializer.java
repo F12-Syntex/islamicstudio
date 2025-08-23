@@ -4,9 +4,9 @@ import java.sql.Connection;
 import java.sql.Statement;
 
 public class SchemaInitializer {
+
     public static void init() {
-        try (Connection conn = DatabaseManager.getConnection();
-             Statement stmt = conn.createStatement()) {
+        try (Connection conn = DatabaseManager.getConnection(); Statement stmt = conn.createStatement()) {
 
             stmt.executeUpdate("""
             CREATE TABLE IF NOT EXISTS surah (
@@ -71,6 +71,40 @@ public class SchemaInitializer {
                 marker TEXT,
                 content TEXT NOT NULL,
                 FOREIGN KEY (ayah_translation_id) REFERENCES ayah_translation(id)
+            );""");
+            
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS hadith_collection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                arabic_name TEXT,
+                short_desc TEXT,
+                num_books INT,
+                num_hadiths INT
+            );""");
+
+                        stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS hadith_book (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collection_id INT NOT NULL,
+                num INT,
+                english_title TEXT,
+                arabic_title TEXT,
+                FOREIGN KEY (collection_id) REFERENCES hadith_collection(id)
+            );""");
+
+                        stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS hadith (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INT NOT NULL,
+                title TEXT,
+                narrator TEXT,
+                english_text TEXT,
+                arabic_text TEXT,
+                local_num TEXT,
+                grade TEXT,
+                uuid TEXT,
+                FOREIGN KEY (book_id) REFERENCES hadith_book(id)
             );""");
 
             System.out.println("✅ Schema initialized.");

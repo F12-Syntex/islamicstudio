@@ -8,4 +8,7 @@
 2. Translation: Sahih International  
    Source: https://tanzil.net/trans/
 
+3. Hadith collection: Jammooly1
+   Source: https://github.com/Jammooly1/hadiths-json-files/tree/main
+
 #====================================================================
