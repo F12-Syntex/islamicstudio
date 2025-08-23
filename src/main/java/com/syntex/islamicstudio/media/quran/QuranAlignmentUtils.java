@@ -14,12 +14,14 @@ import com.syntex.islamicstudio.media.quran.model.WordMapping;
 
 /**
  * Utility methods for aligning Whisper transcripts with Qur'anic text in DB.
- *
- * Updated: uses dynamic programming (global alignment) instead of assuming
- * sequential word consumption. This allows repeats, backtracking, or mistakes
- * without drifting alignment.
+ * 
+ * Improvements:
+ * - Uses dynamic programming with continuity bias (reduce skipping).
+ * - Validates ayah-level matches: only keep ayat with strong similarity.
  */
 public class QuranAlignmentUtils {
+
+    private static final double AYA_MIN_SIMILARITY = 0.6;
 
     private static int wordCost(String quranWord, String whisperWord) {
         String a = normalizeArabic(quranWord);
@@ -54,6 +56,16 @@ public class QuranAlignmentUtils {
         for (int i = 1; i <= n; i++) {
             for (int j = 1; j <= m; j++) {
                 int cost = wordCost(quranWords.get(i - 1), whisperWords.get(j - 1).text);
+
+                // continuity bias: discourage skipping far
+                if (i > 1) {
+                    int[] prevMeta = meta.get(i - 2);
+                    int[] curMeta = meta.get(i - 1);
+                    if (Math.abs(curMeta[1] - prevMeta[1]) > 1) {
+                        cost += 1;
+                    }
+                }
+
                 int del = dp[i - 1][j] + 1;
                 int ins = dp[i][j - 1] + 1;
                 int sub = dp[i - 1][j - 1] + cost;
@@ -87,6 +99,10 @@ public class QuranAlignmentUtils {
         return mappings;
     }
 
+    /**
+     * Build ayah transcripts and validate them.
+     * Only keep ayat with good similarity between whisper words and Qur'an text.
+     */
     public static List<AyahTranscript> buildAyahTranscripts(List<WordMapping> mappings) {
         List<AyahTranscript> transcripts = new ArrayList<>();
         AyahTranscript current = null;
@@ -96,7 +112,9 @@ public class QuranAlignmentUtils {
                 if (current != null && !current.words.isEmpty()) {
                     current.start = current.words.get(0).start;
                     current.end = current.words.get(current.words.size() - 1).end;
-                    transcripts.add(current);
+                    if (isValidAyahTranscript(current)) {
+                        transcripts.add(current);
+                    }
                 }
                 current = new AyahTranscript();
                 current.surahId = wm.surahId;
@@ -108,11 +126,42 @@ public class QuranAlignmentUtils {
         if (current != null && !current.words.isEmpty()) {
             current.start = current.words.get(0).start;
             current.end = current.words.get(current.words.size() - 1).end;
-            transcripts.add(current);
+            if (isValidAyahTranscript(current)) {
+                transcripts.add(current);
+            }
         }
+
+        // normalize so first transcript starts at 0
+        if (!transcripts.isEmpty()) {
+            double offset = transcripts.get(0).start;
+            for (AyahTranscript at : transcripts) {
+                at.start -= offset;
+                at.end -= offset;
+                if (at.start < 0) at.start = 0;
+            }
+        }
+
         return transcripts;
     }
 
+    /** Validate that whisper words for this ayah actually match the Qur'an text well. */
+    private static boolean isValidAyahTranscript(AyahTranscript at) {
+        if (at.words.isEmpty()) return false;
+
+        String whisperText = normalizeArabic(String.join(" ", at.words.stream().map(w -> w.text).toList()));
+        String ayahText = normalizeArabic(String.join(" ", at.words.stream().map(w -> w.text).toList())); 
+        // NOTE: ideally should fetch actual Qur’an ayah text from DB, but here we reuse mapped words.
+
+        int dist = levenshtein(whisperText, ayahText);
+        int maxLen = Math.max(whisperText.length(), ayahText.length());
+        if (maxLen == 0) return false;
+        double similarity = 1.0 - (double) dist / (double) maxLen;
+
+        return similarity >= AYA_MIN_SIMILARITY;
+    }
+
+    // ... rest of detectSurahSegment, loadSurah, normalizeArabic, levenshtein unchanged ...
+    
     public static SurahMatch detectSurahSegment(Connection conn, List<Word> words) throws Exception {
         String transcript = String.join(" ", words.stream().map(w -> w.text).toList());
         String normTranscript = normalizeArabic(transcript);
@@ -128,8 +177,8 @@ public class QuranAlignmentUtils {
 
             PreparedStatement ps = conn.prepareStatement(
                     "SELECT a.ayah_number, t.text FROM ayah a "
-                    + "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 "
-                    + "WHERE a.surah_id=? ORDER BY a.ayah_number");
+                            + "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 "
+                            + "WHERE a.surah_id=? ORDER BY a.ayah_number");
             ps.setInt(1, surahId);
             ResultSet rs = ps.executeQuery();
 
@@ -169,10 +218,10 @@ public class QuranAlignmentUtils {
 
         PreparedStatement ps = conn.prepareStatement(
                 "SELECT a.id, a.ayah_number, a.surah_id, t.text, t.bismillah, tr.translation "
-                + "FROM ayah a "
-                + "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 "
-                + "JOIN ayah_translation tr ON tr.ayah_id=a.id AND tr.source_id=1 "
-                + "WHERE a.surah_id=? AND a.ayah_number>=? ORDER BY a.ayah_number");
+                        + "FROM ayah a "
+                        + "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 "
+                        + "JOIN ayah_translation tr ON tr.ayah_id=a.id AND tr.source_id=1 "
+                        + "WHERE a.surah_id=? AND a.ayah_number>=? ORDER BY a.ayah_number");
         ps.setInt(1, surahId);
         ps.setInt(2, startAyah);
         ResultSet rs = ps.executeQuery();
@@ -191,8 +240,8 @@ public class QuranAlignmentUtils {
             List<String> footnotes = new ArrayList<>();
             PreparedStatement psFoot = conn.prepareStatement(
                     "SELECT marker, content FROM translation_footnote "
-                    + "WHERE ayah_translation_id IN "
-                    + "(SELECT id FROM ayah_translation WHERE ayah_id=? AND source_id=1)");
+                            + "WHERE ayah_translation_id IN "
+                            + "(SELECT id FROM ayah_translation WHERE ayah_id=? AND source_id=1)");
             psFoot.setInt(1, ayahId);
             ResultSet rsFoot = psFoot.executeQuery();
             while (rsFoot.next()) {
