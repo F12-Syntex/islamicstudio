@@ -15,23 +15,27 @@ import com.syntex.islamicstudio.media.quran.model.WordMapping;
 /**
  * Utility methods for aligning Whisper transcripts with Qur'anic text in DB.
  * 
- * Improvements:
- * - Uses dynamic programming with continuity bias (reduce skipping).
- * - Validates ayah-level matches: only keep ayat with strong similarity.
+ * Fixes:
+ * - Global anchor once (detectSurahSegment).
+ * - Sequential ayah matching (matchNextAyah).
+ * - Stronger similarity checks (normalized Arabic).
+ * - Prevents drift, stalls, and ayah mis-detection.
  */
 public class QuranAlignmentUtils {
 
-    private static final double AYA_MIN_SIMILARITY = 0.6;
+    private static final double AYA_MIN_SIMILARITY = 0.55; // relaxed threshold
+
+    // -----------------------------
+    // WORD-LEVEL ALIGNMENT (unchanged mostly)
+    // -----------------------------
 
     private static int wordCost(String quranWord, String whisperWord) {
         String a = normalizeArabic(quranWord);
         String b = normalizeArabic(whisperWord);
-        if (a.isEmpty() || b.isEmpty()) {
-            return 1;
-        }
+        if (a.isEmpty() || b.isEmpty()) return 1;
         int dist = levenshtein(a, b);
         int maxLen = Math.max(a.length(), b.length());
-        double sim = 1.0 - (double) dist / (double) maxLen;
+        double sim = 1.0 - (double) dist / maxLen;
         return (sim >= 0.7) ? 0 : 1;
     }
 
@@ -56,15 +60,6 @@ public class QuranAlignmentUtils {
         for (int i = 1; i <= n; i++) {
             for (int j = 1; j <= m; j++) {
                 int cost = wordCost(quranWords.get(i - 1), whisperWords.get(j - 1).text);
-
-                // continuity bias: discourage skipping far
-                if (i > 1) {
-                    int[] prevMeta = meta.get(i - 2);
-                    int[] curMeta = meta.get(i - 1);
-                    if (Math.abs(curMeta[1] - prevMeta[1]) > 1) {
-                        cost += 1;
-                    }
-                }
 
                 int del = dp[i - 1][j] + 1;
                 int ins = dp[i][j - 1] + 1;
@@ -99,10 +94,10 @@ public class QuranAlignmentUtils {
         return mappings;
     }
 
-    /**
-     * Build ayah transcripts and validate them.
-     * Only keep ayat with good similarity between whisper words and Qur'an text.
-     */
+    // -----------------------------
+    // TRANSCRIPT BUILDER
+    // -----------------------------
+
     public static List<AyahTranscript> buildAyahTranscripts(List<WordMapping> mappings) {
         List<AyahTranscript> transcripts = new ArrayList<>();
         AyahTranscript current = null;
@@ -112,9 +107,7 @@ public class QuranAlignmentUtils {
                 if (current != null && !current.words.isEmpty()) {
                     current.start = current.words.get(0).start;
                     current.end = current.words.get(current.words.size() - 1).end;
-                    if (isValidAyahTranscript(current)) {
-                        transcripts.add(current);
-                    }
+                    transcripts.add(current);
                 }
                 current = new AyahTranscript();
                 current.surahId = wm.surahId;
@@ -126,9 +119,7 @@ public class QuranAlignmentUtils {
         if (current != null && !current.words.isEmpty()) {
             current.start = current.words.get(0).start;
             current.end = current.words.get(current.words.size() - 1).end;
-            if (isValidAyahTranscript(current)) {
-                transcripts.add(current);
-            }
+            transcripts.add(current);
         }
 
         // normalize so first transcript starts at 0
@@ -144,24 +135,11 @@ public class QuranAlignmentUtils {
         return transcripts;
     }
 
-    /** Validate that whisper words for this ayah actually match the Qur'an text well. */
-    private static boolean isValidAyahTranscript(AyahTranscript at) {
-        if (at.words.isEmpty()) return false;
+    // -----------------------------
+    // AYAH MATCHING (FIXED)
+    // -----------------------------
 
-        String whisperText = normalizeArabic(String.join(" ", at.words.stream().map(w -> w.text).toList()));
-        String ayahText = normalizeArabic(String.join(" ", at.words.stream().map(w -> w.text).toList())); 
-        // NOTE: ideally should fetch actual Qur’an ayah text from DB, but here we reuse mapped words.
-
-        int dist = levenshtein(whisperText, ayahText);
-        int maxLen = Math.max(whisperText.length(), ayahText.length());
-        if (maxLen == 0) return false;
-        double similarity = 1.0 - (double) dist / (double) maxLen;
-
-        return similarity >= AYA_MIN_SIMILARITY;
-    }
-
-    // ... rest of detectSurahSegment, loadSurah, normalizeArabic, levenshtein unchanged ...
-    
+    /** Global anchor: detect surah + starting ayah using sliding window. */
     public static SurahMatch detectSurahSegment(Connection conn, List<Word> words) throws Exception {
         String transcript = String.join(" ", words.stream().map(w -> w.text).toList());
         String normTranscript = normalizeArabic(transcript);
@@ -176,9 +154,9 @@ public class QuranAlignmentUtils {
             int surahId = rsSurah.getInt("id");
 
             PreparedStatement ps = conn.prepareStatement(
-                    "SELECT a.ayah_number, t.text FROM ayah a "
-                            + "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 "
-                            + "WHERE a.surah_id=? ORDER BY a.ayah_number");
+                    "SELECT a.ayah_number, t.text FROM ayah a " +
+                            "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
+                            "WHERE a.surah_id=? ORDER BY a.ayah_number");
             ps.setInt(1, surahId);
             ResultSet rs = ps.executeQuery();
 
@@ -194,7 +172,7 @@ public class QuranAlignmentUtils {
 
                 int dist = levenshtein(normTranscript, chunk);
                 int maxLen = Math.max(normTranscript.length(), chunk.length());
-                double similarity = 1.0 - (double) dist / (double) maxLen;
+                double similarity = 1.0 - (double) dist / maxLen;
 
                 if (similarity > best.score) {
                     best.surahId = surahId;
@@ -205,6 +183,43 @@ public class QuranAlignmentUtils {
         }
         return best;
     }
+
+    /** Sequential matcher: given last ayah and transcript chunk, find the next ayah. */
+    public static int matchNextAyah(Connection conn, int surahId, int lastAyah, String transcriptChunk) throws Exception {
+        int bestAyah = lastAyah;
+        double bestScore = -1;
+
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT ayah_number, text FROM ayah a " +
+                        "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
+                        "WHERE a.surah_id=? AND a.ayah_number BETWEEN ? AND ?")) {
+
+            ps.setInt(1, surahId);
+            ps.setInt(2, lastAyah);
+            ps.setInt(3, lastAyah + 2); // check current, next, +1 skip
+            ResultSet rs = ps.executeQuery();
+
+            while (rs.next()) {
+                int ayahNum = rs.getInt("ayah_number");
+                String text = rs.getString("text");
+                double sim = similarity(transcriptChunk, text);
+                if (sim > bestScore) {
+                    bestScore = sim;
+                    bestAyah = ayahNum;
+                }
+            }
+        }
+
+        if (bestScore < AYA_MIN_SIMILARITY) {
+            bestAyah = lastAyah + 1; // fallback sequentially
+        }
+
+        return bestAyah;
+    }
+
+    // -----------------------------
+    // LOADERS
+    // -----------------------------
 
     public static List<Ayah> loadSurah(Connection conn, int surahId, int startAyah, String transcript) throws Exception {
         List<Ayah> ayat = new ArrayList<>();
@@ -217,11 +232,11 @@ public class QuranAlignmentUtils {
         }
 
         PreparedStatement ps = conn.prepareStatement(
-                "SELECT a.id, a.ayah_number, a.surah_id, t.text, t.bismillah, tr.translation "
-                        + "FROM ayah a "
-                        + "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 "
-                        + "JOIN ayah_translation tr ON tr.ayah_id=a.id AND tr.source_id=1 "
-                        + "WHERE a.surah_id=? AND a.ayah_number>=? ORDER BY a.ayah_number");
+                "SELECT a.id, a.ayah_number, a.surah_id, t.text, t.bismillah, tr.translation " +
+                        "FROM ayah a " +
+                        "JOIN ayah_text t ON t.ayah_id=a.id AND t.source_id=1 " +
+                        "JOIN ayah_translation tr ON tr.ayah_id=a.id AND tr.source_id=1 " +
+                        "WHERE a.surah_id=? AND a.ayah_number>=? ORDER BY a.ayah_number");
         ps.setInt(1, surahId);
         ps.setInt(2, startAyah);
         ResultSet rs = ps.executeQuery();
@@ -239,9 +254,9 @@ public class QuranAlignmentUtils {
 
             List<String> footnotes = new ArrayList<>();
             PreparedStatement psFoot = conn.prepareStatement(
-                    "SELECT marker, content FROM translation_footnote "
-                            + "WHERE ayah_translation_id IN "
-                            + "(SELECT id FROM ayah_translation WHERE ayah_id=? AND source_id=1)");
+                    "SELECT marker, content FROM translation_footnote " +
+                            "WHERE ayah_translation_id IN " +
+                            "(SELECT id FROM ayah_translation WHERE ayah_id=? AND source_id=1)");
             psFoot.setInt(1, ayahId);
             ResultSet rsFoot = psFoot.executeQuery();
             while (rsFoot.next()) {
@@ -253,12 +268,25 @@ public class QuranAlignmentUtils {
         return ayat;
     }
 
-    private static String normalizeArabic(String input) {
+    // -----------------------------
+    // HELPERS
+    // -----------------------------
+
+    public static String normalizeArabic(String input) {
         if (input == null) return "";
         return input.replaceAll("[\\u064B-\\u065F]", "")
                 .replaceAll("[^\\p{IsArabic} ]", "")
                 .replaceAll("\\s+", " ")
                 .trim();
+    }
+
+    private static double similarity(String a, String b) {
+        a = normalizeArabic(a);
+        b = normalizeArabic(b);
+        int dist = levenshtein(a, b);
+        int maxLen = Math.max(a.length(), b.length());
+        if (maxLen == 0) return 0.0;
+        return 1.0 - (double) dist / maxLen;
     }
 
     private static int levenshtein(String a, String b) {
