@@ -3,7 +3,8 @@ package com.syntex.islamicstudio.env;
 public enum EnvKey {
     API_KEY("API_KEY"),
     DEBUG("DEBUG"),
-    PORT("PORT");
+    PORT("PORT"),
+    PIXABAY_API_KEY("PIXABAY_API_KEY");
 
     private final String key;
 

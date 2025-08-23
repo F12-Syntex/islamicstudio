@@ -14,6 +14,7 @@ import com.openai.models.audio.transcriptions.TranscriptionCreateParams;
 import com.openai.models.audio.transcriptions.TranscriptionCreateResponse;
 import com.openai.models.audio.transcriptions.TranscriptionSegment;
 import com.openai.models.audio.transcriptions.TranscriptionVerbose;
+import com.syntex.islamicstudio.media.quran.model.Word;
 
 /**
  * Wrapper around OpenAI Whisper API for transcription.
@@ -76,13 +77,13 @@ public class WhisperTranscriber {
     /**
      * Return word-level timestamps by splitting segments evenly.
      */
-    public List<RawTranscriptionVideoPipeline.Word> transcribeWithTimestamps(File audioFile) {
-        List<RawTranscriptionVideoPipeline.Word> words = new ArrayList<>();
+    public List<Word> transcribeWithTimestamps(File audioFile) {
+        List<Word> words = new ArrayList<>();
         for (Segment seg : transcribeSegments(audioFile)) {
             String[] segWords = seg.text.trim().split("\\s+");
             double wordDur = (seg.end - seg.start) / segWords.length;
             for (int i = 0; i < segWords.length; i++) {
-                RawTranscriptionVideoPipeline.Word w = new RawTranscriptionVideoPipeline.Word();
+                Word w = new Word();
                 w.text = segWords[i];
                 w.start = seg.start + i * wordDur;
                 w.end = w.start + wordDur;
