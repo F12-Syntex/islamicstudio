@@ -73,27 +73,29 @@ public class SchemaInitializer {
                 FOREIGN KEY (ayah_translation_id) REFERENCES ayah_translation(id)
             );""");
             
+            // Hadith tables (with recommended constraints)
             stmt.executeUpdate("""
             CREATE TABLE IF NOT EXISTS hadith_collection (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
+                name TEXT NOT NULL UNIQUE,
                 arabic_name TEXT,
                 short_desc TEXT,
                 num_books INT,
                 num_hadiths INT
             );""");
 
-                        stmt.executeUpdate("""
+            stmt.executeUpdate("""
             CREATE TABLE IF NOT EXISTS hadith_book (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 collection_id INT NOT NULL,
                 num INT,
                 english_title TEXT,
                 arabic_title TEXT,
-                FOREIGN KEY (collection_id) REFERENCES hadith_collection(id)
+                UNIQUE(collection_id, num),
+                FOREIGN KEY (collection_id) REFERENCES hadith_collection(id) ON DELETE CASCADE
             );""");
 
-                        stmt.executeUpdate("""
+            stmt.executeUpdate("""
             CREATE TABLE IF NOT EXISTS hadith (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 book_id INT NOT NULL,
@@ -104,7 +106,8 @@ public class SchemaInitializer {
                 local_num TEXT,
                 grade TEXT,
                 uuid TEXT,
-                FOREIGN KEY (book_id) REFERENCES hadith_book(id)
+                UNIQUE(uuid),
+                FOREIGN KEY (book_id) REFERENCES hadith_book(id) ON DELETE CASCADE
             );""");
 
             System.out.println("✅ Schema initialized.");
